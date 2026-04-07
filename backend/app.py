@@ -44,9 +44,40 @@ def extract_keywords_gemini(user_query: str) -> str:
         print(f"Gemini API error during keyword extraction: {e}")
         return user_query
 
-def summarize_data_gemini(datasets: list) -> dict:
+def build_fallback_summary(datasets: list, keyword: str = None, year: str = None, region: str = None) -> dict:
     if not datasets:
-        return None
+        return {
+            "layman_summary_points": ["No datasets were returned for that search."],
+            "satellite_data_points": []
+        }
+
+    titles = [ds.get("title") for ds in datasets[:3] if ds.get("title")]
+    centers = sorted({ds.get("dataCenter") for ds in datasets if ds.get("dataCenter") and ds.get("dataCenter") != "Unknown"})
+    location_count = sum(1 for ds in datasets if ds.get("latitude") is not None and ds.get("longitude") is not None)
+
+    layman_points = [f"Found {len(datasets)} NASA datasets matching the search."]
+    if keyword:
+        layman_points.append(f"The search was centered on {keyword} related Earth data.")
+    if year:
+        layman_points.append(f"Results were filtered to the year {year}.")
+    if region:
+        layman_points.append(f"Results were narrowed to the {region} region.")
+    if titles:
+        layman_points.append(f"Example matches include {', '.join(titles[:3])}.")
+
+    satellite_points = [f"{location_count} results include usable map coordinates."]
+    if centers:
+        satellite_points.append(f"Observed data centers include {', '.join(centers[:3])}.")
+
+    return {
+        "layman_summary_points": layman_points,
+        "satellite_data_points": satellite_points
+    }
+
+
+def summarize_data_gemini(datasets: list, keyword: str = None, year: str = None, region: str = None) -> dict:
+    if not datasets:
+        return build_fallback_summary(datasets, keyword=keyword, year=year, region=region)
     dataset_text = "".join([f"Title: {ds.get('title')}\nSummary: {ds.get('summary')}\n\n" for ds in datasets])
     prompt = f"""
     Summarize these NASA datasets:
@@ -60,18 +91,24 @@ def summarize_data_gemini(datasets: list) -> dict:
     """
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(response_mime_type="application/json"))
-        cleaned = re.search(r'\{.*\}', response.text.strip(), re.DOTALL)
-        return json.loads(cleaned.group(0)) if cleaned else {
-            'layman_summary_points': ["Summary unavailable"],
-            'satellite_data_points': []
-        }
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0,
+                max_output_tokens=256,
+            ),
+        )
+        cleaned = re.search(r'\{.*\}', response.text.strip(), re.DOTALL) if getattr(response, "text", None) else None
+        parsed = json.loads(cleaned.group(0)) if cleaned else None
+        if not isinstance(parsed, dict):
+            raise ValueError("Gemini summary did not return a JSON object")
+        parsed.setdefault("layman_summary_points", ["Summary unavailable"])
+        parsed.setdefault("satellite_data_points", [])
+        return parsed
     except Exception as e:
         print(f"Gemini summarization error: {e}")
-        return {
-            'layman_summary_points': ["Summary unavailable"],
-            'satellite_data_points': []
-        }
+        return build_fallback_summary(datasets, keyword=keyword, year=year, region=region)
 
 def parse_bbox_string(bbox_str):
     """
@@ -128,10 +165,11 @@ def fetch_granule_location(collection_id):
         return None
 
 
-def search_nasa_cmr(keywords: str):
-    params = {'keyword': keywords, 'page_size': '20'}
+def search_nasa_cmr(params: dict, enrich_locations: bool = False):
+    request_params = dict(params)
+    request_params.setdefault('page_size', 10)
     try:
-        resp = requests.get(CMR_BASE, params=params, timeout=20)
+        resp = requests.get(CMR_BASE, params=request_params, timeout=20)
         resp.raise_for_status()
         entries = resp.json().get('feed', {}).get('entry', [])
         datasets = []
@@ -162,7 +200,7 @@ def search_nasa_cmr(keywords: str):
                     print(f"Error parsing collection bounding box for {ds.get('id')}: {e}")
 
             # --- Use granule-level location for more precision ---
-            if ds.get('id'):
+            if enrich_locations and ds.get('id'):
                 loc = fetch_granule_location(ds['id'])
                 if loc:
                     lat, lon = loc
@@ -179,7 +217,8 @@ def search_nasa_cmr(keywords: str):
                 'dataCenter': ds.get('data_center', 'Unknown'),
                 'timeStart': time_start,
                 'latitude': lat,
-                'longitude': lon
+                'longitude': lon,
+                'link': next((L.get("href") for L in ds.get("links", []) if isinstance(L, dict) and L.get("href")), None)
             })
         return datasets
 
@@ -204,6 +243,31 @@ def build_temporal(year):
 def health():
     return jsonify({"status": "ok"})
 
+
+@app.get("/api/dataset/<dataset_id>")
+def dataset_detail(dataset_id):
+    try:
+        resp = requests.get(CMR_BASE, params={"concept_id": dataset_id, "page_size": 1}, timeout=20)
+        resp.raise_for_status()
+        entry = resp.json().get('feed', {}).get('entry', [])
+        if not entry:
+            return jsonify({"error": "dataset not found"}), 404
+
+        ds = entry[0]
+        link = next((L.get("href") for L in ds.get("links", []) if isinstance(L, dict) and L.get("href")), None)
+        return jsonify({
+            "id": ds.get('id', dataset_id),
+            "title": ds.get('title', 'No title available'),
+            "summary": ds.get('summary', 'No summary available.'),
+            "dataCenter": ds.get('data_center', 'Unknown'),
+            "timeStart": ds.get('time_start'),
+            "link": link,
+        })
+    except Exception as e:
+        print(f"Dataset lookup failed for {dataset_id}: {e}")
+        return jsonify({"error": "Failed to fetch dataset details."}), 500
+
+
 @app.get("/api/search")
 def search():
     q = request.args.get("q", "").strip()
@@ -215,24 +279,8 @@ def search():
         params["temporal"] = build_temporal(year)
     if region:
         params["bounding_box"] = ",".join(map(str, NAMED_BBOX[region]))
-    results = search_nasa_cmr(keyword)
-    # Add link field to each result (preserve previous version's link logic)
-    for r in results:
-        r['link'] = None
-    try:
-        resp = requests.get(CMR_BASE, params=params, timeout=20)
-        entries = resp.json().get('feed', {}).get('entry', [])
-        for idx, e in enumerate(entries):
-            link = None
-            for L in e.get("links", []):
-                if "href" in L:
-                    link = L["href"]
-                    break
-            if idx < len(results):
-                results[idx]['link'] = link
-    except Exception:
-        pass
-    summary_data = summarize_data_gemini(results)
+    results = search_nasa_cmr(params, enrich_locations=False)
+    summary_data = summarize_data_gemini(results, keyword=keyword, year=year, region=region)
     return jsonify({"query": {"raw": q, "keyword": keyword, "year": year, "region": region, "params_sent": params},
                     "results": results, "summary": summary_data})
 
@@ -249,7 +297,7 @@ def gemini_search():
         return jsonify({'error': 'Query is required.'}), 400
     try:
         keywords = extract_keywords_gemini(user_query)
-        datasets = search_nasa_cmr(keywords)
+        datasets = search_nasa_cmr({'keyword': keywords, 'page_size': 10}, enrich_locations=False)
         result = {
             'originalQuery': user_query,
             'extractedKeywords': keywords,
@@ -268,7 +316,7 @@ def chat_assistant():
         return jsonify({'error': 'Query is required.'}), 400
 
     keywords = extract_keywords_gemini(user_query)
-    datasets = search_nasa_cmr(keywords)
+    datasets = search_nasa_cmr({'keyword': keywords, 'page_size': 10}, enrich_locations=False)
 
     context = "\n".join([f"{ds['title']}: {ds['summary']}" for ds in datasets[:5]])
     prompt = (
