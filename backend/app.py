@@ -255,13 +255,31 @@ def dataset_detail(dataset_id):
 
         ds = entry[0]
         link = next((L.get("href") for L in ds.get("links", []) if isinstance(L, dict) and L.get("href")), None)
+        footprint_bbox = None
+        if ds.get("boxes"):
+            box = ds["boxes"][0]
+            if isinstance(box, list):
+                box = box[0]
+            if isinstance(box, str):
+                footprint_bbox = parse_bbox_string(box)
+
         return jsonify({
             "id": ds.get('id', dataset_id),
             "title": ds.get('title', 'No title available'),
             "summary": ds.get('summary', 'No summary available.'),
             "dataCenter": ds.get('data_center', 'Unknown'),
             "timeStart": ds.get('time_start'),
+            "timeEnd": ds.get('time_end'),
+            "versionId": ds.get('version_id'),
+            "nativeId": ds.get('native_id'),
+            "updated": ds.get('updated'),
+            "temporalExtent": {
+                "start": ds.get('time_start'),
+                "end": ds.get('time_end')
+            },
+            "footprint_bbox": footprint_bbox,
             "link": link,
+            "raw": ds,
         })
     except Exception as e:
         print(f"Dataset lookup failed for {dataset_id}: {e}")

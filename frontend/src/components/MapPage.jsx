@@ -157,6 +157,25 @@ function MapPage() {
                 <p style={{ fontSize: '0.9rem', color: '#ccc', margin: 0 }}>
                   {r.summary ? r.summary.substring(0, 100) + '...' : 'No summary available.'}
                 </p>
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    navigate(`/dataset/${r.id}`, { state: r });
+                  }}
+                  style={{
+                    marginTop: '0.9rem',
+                    background: 'linear-gradient(135deg, #00bcd4, #22c55e)',
+                    border: 'none',
+                    color: '#06111f',
+                    borderRadius: '999px',
+                    padding: '0.65rem 1rem',
+                    fontWeight: 700,
+                    cursor: 'pointer'
+                  }}
+                >
+                  Open full dataset
+                </button>
               </div>
             ))}
           </div>
