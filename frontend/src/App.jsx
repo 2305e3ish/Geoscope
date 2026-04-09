@@ -1,53 +1,14 @@
-import { Routes, Route, useNavigate } from "react-router-dom";
-import { ReactTyped } from "react-typed";
+import { Routes, Route } from "react-router-dom";
 import "./App.css";
-import MapPage from "./components/MapPage"; // Create this file
-import DatasetPage from "./components/DatasetPage";
-
-function Home() {
-  const navigate = useNavigate();
-
-  return (
-    <>
-      {/* 3D Background */}
-      <div style={{
-        position: "fixed",
-        top: 0,
-        left: 0,
-        width: "100vw",
-        height: "100vh",
-        zIndex: -1
-      }}>
-        <iframe src='https://my.spline.design/earthwallpaper-W7GbLN5wWGUUV5lqirBHTPIk/' frameBorder='0' width='100%' height='100%'></iframe>
-      </div>
-      <div className="overlay">
-        <ReactTyped
-          className="subtitle"
-          strings={[
-            "Explore the Earth in 3D.",
-            "Discover insights with AI.",
-            "Visualize geospatial data like never before."
-          ]}
-          typeSpeed={40}
-          backSpeed={30}
-          loop
-        />
-        <button className="button" onClick={() => navigate("/map")}>
-          <span className="button_lg">
-            <span className="button_sl"></span>
-            <span className="button_text">Explore Now</span>
-          </span>
-        </button>
-      </div>
-    </>
-  );
-}
+import DatasetPage from "./pages/DatasetPage";
+import HomePage from "./pages/HomePage";
+import SearchPage from "./pages/SearchPage";
 
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/map" element={<MapPage />} />
+      <Route path="/" element={<HomePage />} />
+      <Route path="/map" element={<SearchPage />} />
       <Route path="/dataset/:id" element={<DatasetPage />} />
     </Routes>
   );

@@ -8,5 +8,13 @@ services:
     envVars:
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: CMR_CLIENT_ID
+        value: "GeoScope"
       - key: USER_AGENT
-        value: "EarthDataFinder/1.0 (contact@example.com)"
+        value: "GeoScope/1.0 (contact@example.com)"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: EMBEDDING_MODEL
+        value: "all-MiniLM-L6-v2"
+      - key: RAG_TOP_K
+        value: "5"

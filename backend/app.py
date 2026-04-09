@@ -1,293 +1,403 @@
 import os
-import re
-import requests
-import google.generativeai as genai
-from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import json
 
-load_dotenv()
+from config import ALLOWED_ORIGINS, GEMINI_ENABLED
+from services.cmr_client import fetch_dataset_by_id, search_nasa_cmr
+from services.gemini_service import (
+    extract_keywords_gemini,
+    summarize_data_gemini,
+)
+from services.hybrid_ranker import hybrid_search
+from services.lexical_search import local_lexical_search
+from services.metadata_store import load_jsonl, rebuild_sqlite
+from services.query_parser import build_search_params, informative_query_terms, parse_query
+from services.rag_service import assistant_answer, compare_datasets
+from services.recommender import get_similar_datasets
+from services.retriever import get_local_dataset, suggest_queries
+from services.vector_search import local_vector_search
+from services.explainer import explain_dataset
+
 app = Flask(__name__)
-CORS(app)
 
-CMR_BASE = "https://cmr.earthdata.nasa.gov/search/collections.json"
-CMR_GRANULES = "https://cmr.earthdata.nasa.gov/search/granules.json"
-
-NAMED_BBOX = {
-    "india": [68, 6, 97, 36],
-    "global": [-180, -90, 180, 90],
-    "california": [-125, 32, -113, 43],
-    "europe": [-11, 34, 31, 72],
-    "indonesia": [95, -11, 141, 6],
-}
-
-EVENT_KEYWORDS = [
-    "flood", "volcano", "wildfire", "fire", "cyclone", "hurricane",
-    "storm", "rainfall", "aerosol", "ash", "landslide", "drought"
-]
-
-# --- Gemini Integration ---
-API_KEY = os.getenv('API_KEY')
-if not API_KEY:
-    raise RuntimeError("A Google Gemini API key is required. Please set the API_KEY environment variable.")
-genai.configure(api_key=API_KEY)
-
-# ---- Helper Functions ----
-def extract_keywords_gemini(user_query: str) -> str:
-    prompt = f"Extract the most relevant keywords for a NASA Earth science data search from the following user request: '{user_query}'. Return a short, comma-separated list of 2-5 keywords only."
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print(f"Gemini API error during keyword extraction: {e}")
-        return user_query
-
-def summarize_data_gemini(datasets: list) -> dict:
-    if not datasets:
-        return None
-    dataset_text = "".join([f"Title: {ds.get('title')}\nSummary: {ds.get('summary')}\n\n" for ds in datasets])
-    prompt = f"""
-    Summarize these NASA datasets:
-    {dataset_text}
-
-    Respond in JSON with:
-    {{
-      "layman_summary_points": ["point1", "point2"],
-      "satellite_data_points": ["point1", "point2"]
-    }}
-    """
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(response_mime_type="application/json"))
-        cleaned = re.search(r'\{.*\}', response.text.strip(), re.DOTALL)
-        return json.loads(cleaned.group(0)) if cleaned else {
-            'layman_summary_points': ["Summary unavailable"],
-            'satellite_data_points': []
-        }
-    except Exception as e:
-        print(f"Gemini summarization error: {e}")
-        return {
-            'layman_summary_points': ["Summary unavailable"],
-            'satellite_data_points': []
-        }
-
-def parse_bbox_string(bbox_str):
-    """
-    Parse a bounding box string into [min_lat, min_lon, max_lat, max_lon].
-    Supports both space-separated and comma-separated formats.
-    """
-    if not bbox_str:
-        return None
-    try:
-        parts = re.split(r'[,\s]+', bbox_str.strip())
-        coords = [float(x) for x in parts if x.strip()]
-        if len(coords) == 4:
-            return coords
-    except Exception as e:
-        print(f"Error parsing bbox string '{bbox_str}': {e}")
-    return None
-
-def fetch_granule_location(collection_id):
-    """Fetch more accurate lat/lon from granules of the dataset."""
-    try:
-        params = {'collection_concept_id': collection_id, 'page_size': 5}
-        resp = requests.get(CMR_GRANULES, params=params, timeout=15)
-        if not resp.ok:
-            return None
-
-        granules = resp.json().get('feed', {}).get('entry', [])
-        if not granules:
-            return None
-
-        granule = granules[0]
-
-        # --- Handle boxes ---
-        if 'boxes' in granule and granule['boxes']:
-            box = granule['boxes'][0]
-            if isinstance(box, list):
-                box = box[0]
-            if isinstance(box, str):
-                coords = list(map(float, box.split(",")))
-                return round((coords[0] + coords[2]) / 2, 6), round((coords[1] + coords[3]) / 2, 6)
-
-        # --- Handle polygons ---
-        elif 'polygons' in granule and granule['polygons']:
-            poly = granule['polygons'][0]
-            if isinstance(poly, list):
-                poly = poly[0]
-            if isinstance(poly, str):
-                pts = poly.strip().split(' ')[0].split(',')
-                return float(pts[0]), float(pts[1])
-
-        return None
-
-    except Exception as e:
-        print(f"Granule location fetch failed for {collection_id}: {e}")
-        return None
+if ALLOWED_ORIGINS in {"", "*"}:
+    CORS(app)
+else:
+    origins = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
+    CORS(app, resources={r"/api/*": {"origins": origins}})
 
 
-def search_nasa_cmr(keywords: str):
-    params = {'keyword': keywords, 'page_size': '20'}
-    try:
-        resp = requests.get(CMR_BASE, params=params, timeout=20)
-        resp.raise_for_status()
-        entries = resp.json().get('feed', {}).get('entry', [])
-        datasets = []
-
-        for idx, ds in enumerate(entries):
-            time_start = ds.get('time_start', 'N/A')
-            try:
-                if time_start != 'N/A':
-                    from datetime import datetime
-                    time_start = datetime.strptime(time_start, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
-            except:
-                pass
-
-            lat, lon = None, None
-
-            # --- Handle collection-level boxes ---
-            if ds.get("boxes"):
-                try:
-                    box = ds["boxes"][0]
-                    if isinstance(box, list):
-                        box = box[0]
-                    if isinstance(box, str):
-                        coords = parse_bbox_string(box)
-                        if coords:
-                            lat = round((coords[0] + coords[2]) / 2, 6)
-                            lon = round((coords[1] + coords[3]) / 2, 6)
-                except Exception as e:
-                    print(f"Error parsing collection bounding box for {ds.get('id')}: {e}")
-
-            # --- Use granule-level location for more precision ---
-            if ds.get('id'):
-                loc = fetch_granule_location(ds['id'])
-                if loc:
-                    lat, lon = loc
-
-            # --- Fallback if no coords found ---
-            if lat is None or lon is None:
-                lat = (idx * 10) % 90
-                lon = (idx * 20) % 180
-
-            datasets.append({
-                'id': ds.get('id', 'N/A'),
-                'title': ds.get('title', 'No title available'),
-                'summary': ds.get('summary', 'No summary available.'),
-                'dataCenter': ds.get('data_center', 'Unknown'),
-                'timeStart': time_start,
-                'latitude': lat,
-                'longitude': lon
-            })
-        return datasets
-
-    except Exception as e:
-        print(f"NASA CMR API request failed: {e}")
-        raise Exception("Failed to fetch data from NASA.")
-
-
-def parse_query(q):
-    ql = q.lower()
-    keyword = next((w for w in EVENT_KEYWORDS if w in ql), q)
-    year = re.search(r"\b(19\d{2}|20\d{2})\b", ql)
-    year = year.group(1) if year else None
-    region = next((name for name in NAMED_BBOX if name in ql), None)
-    return keyword, year, region
-
-def build_temporal(year):
-    return f"{year}-01-01T00:00:00Z,{year}-12-31T23:59:59Z" if year else None
-
-# ---- Routes ----
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "geminiEnabled": GEMINI_ENABLED})
+
+
+def run_live_search(query_params):
+    return search_nasa_cmr(
+        keywords=query_params.get("keyword"),
+        page_size=query_params.get("page_size", 10),
+        temporal=query_params.get("temporal"),
+        bounding_box=query_params.get("bounding_box"),
+    )
+
+
+def run_local_search(query, year=None, region=None, limit=10):
+    return hybrid_search(query, year=year, region=region, limit=limit)
+
+
+def merge_search_results(live_results, local_results, limit=10):
+    local_by_id = {
+        result.get("id"): result for result in local_results if result.get("id")
+    }
+    merged = []
+    seen = set()
+
+    for live_result in live_results:
+        result_id = live_result.get("id")
+        local_result = local_by_id.get(result_id)
+        if local_result is not None:
+            merged_result = {
+                **live_result,
+                "score": local_result.get("score"),
+                "lexicalScore": local_result.get("lexicalScore"),
+                "vectorScore": local_result.get("vectorScore"),
+                "metadataQualityScore": local_result.get("metadataQualityScore"),
+                "matchedTerms": local_result.get("matchedTerms", []),
+                "matchedFilters": local_result.get("matchedFilters", []),
+                "matchReasons": local_result.get("matchReasons", []),
+                "hybridBreakdown": local_result.get("hybridBreakdown"),
+                "retrievalSources": ["live_cmr", *local_result.get("retrievalSources", [])],
+            }
+        else:
+            merged_result = {**live_result, "retrievalSources": ["live_cmr"]}
+        merged.append(merged_result)
+        if result_id:
+            seen.add(result_id)
+        if len(merged) >= limit:
+            return merged
+
+    for local_result in local_results:
+        result_id = local_result.get("id")
+        if result_id in seen:
+            continue
+        merged.append(
+            {
+                **local_result,
+                "retrievalSources": sorted(
+                    set(["local_hybrid", *local_result.get("retrievalSources", [])])
+                ),
+            }
+        )
+        if len(merged) >= limit:
+            break
+
+    return merged
+
+
+def should_fallback_to_live(query, results):
+    if not results:
+        return True, "no_local_results"
+
+    query_terms = informative_query_terms(query)
+    if not query_terms:
+        return False, None
+
+    top_result = results[0]
+    matched_terms = {str(term).lower() for term in (top_result.get("matchedTerms") or [])}
+    matched_count = len(matched_terms.intersection(query_terms))
+    coverage = matched_count / len(query_terms)
+    top_score = float(top_result.get("score") or 0.0)
+
+    if matched_count == 0:
+        return True, "weak_local_match"
+    if coverage < 0.4 and top_score < 0.8:
+        return True, "weak_local_match"
+    return False, None
+
 
 @app.get("/api/search")
 def search():
-    q = request.args.get("q", "").strip()
-    if not q:
+    query = request.args.get("q", "").strip()
+    mode = request.args.get("mode", "auto").strip().lower()
+    if mode not in {"auto", "live", "hybrid"}:
+        return jsonify({"error": "mode must be one of: auto, live, hybrid"}), 400
+
+    if not query:
         return jsonify({"error": "missing q"}), 400
-    keyword, year, region = parse_query(q)
-    params = {"keyword": keyword, "page_size": 10}
-    if year:
-        params["temporal"] = build_temporal(year)
-    if region:
-        params["bounding_box"] = ",".join(map(str, NAMED_BBOX[region]))
-    results = search_nasa_cmr(keyword)
-    # Add link field to each result (preserve previous version's link logic)
-    for r in results:
-        r['link'] = None
-    try:
-        resp = requests.get(CMR_BASE, params=params, timeout=20)
-        entries = resp.json().get('feed', {}).get('entry', [])
-        for idx, e in enumerate(entries):
-            link = None
-            for L in e.get("links", []):
-                if "href" in L:
-                    link = L["href"]
-                    break
-            if idx < len(results):
-                results[idx]['link'] = link
-    except Exception:
-        pass
-    summary_data = summarize_data_gemini(results)
-    return jsonify({"query": {"raw": q, "keyword": keyword, "year": year, "region": region, "params_sent": params},
-                    "results": results, "summary": summary_data})
+
+    search_text, year, region = parse_query(query)
+    params = build_search_params(search_text, year, region, page_size=10)
+    local_corpus_size = local_lexical_search.corpus_size()
+    source = "live_cmr"
+    fallback_reason = None
+    warning = None
+    search_confidence = "high"
+
+    if mode == "live":
+        results = run_live_search(params)
+    elif local_corpus_size > 0:
+        results = run_local_search(search_text, year=year, region=region, limit=params.get("page_size", 10))
+        source = "local_hybrid"
+
+        if mode == "auto":
+            should_fallback, fallback_reason = should_fallback_to_live(search_text, results)
+            if should_fallback:
+                try:
+                    live_results = search_nasa_cmr(
+                        keywords=params.get("keyword"),
+                        page_size=params.get("page_size", 10),
+                        temporal=params.get("temporal"),
+                        bounding_box=params.get("bounding_box"),
+                        timeout=8,
+                    )
+                    if live_results:
+                        results = merge_search_results(
+                            live_results,
+                            results,
+                            limit=params.get("page_size", 10),
+                        )
+                        source = "merged_live_local"
+                        warning = "Local matches were weak, so GeoScope merged in live CMR results."
+                        search_confidence = "medium"
+                    else:
+                        source = "local_hybrid_fallback"
+                        warning = "Live CMR returned no results, so GeoScope is showing best-effort matches from the local index."
+                        search_confidence = "low"
+                        fallback_reason = f"{fallback_reason}_live_empty"
+                except Exception:
+                    source = "local_hybrid_fallback"
+                    warning = "Live CMR was unavailable, so GeoScope is showing best-effort matches from the local index."
+                    search_confidence = "low"
+                    fallback_reason = f"{fallback_reason}_live_unavailable"
+            else:
+                search_confidence = "high"
+    else:
+        results = run_live_search(params)
+        source = "live_cmr_fallback"
+        fallback_reason = "empty_local_corpus"
+
+    summary = summarize_data_gemini(results)
+
+    return jsonify(
+        {
+            "query": {
+                "raw": query,
+                "keyword": search_text,
+                "year": year,
+                "region": region,
+                "params_sent": params,
+                "mode": mode,
+            },
+            "source": source,
+            "localCorpusSize": local_corpus_size,
+            "vectorBackend": (
+                local_vector_search.get_backend()
+                if source.startswith("local") or source == "merged_live_local"
+                else None
+            ),
+            "fallbackReason": fallback_reason,
+            "warning": warning,
+            "searchConfidence": search_confidence,
+            "results": results,
+            "summary": summary,
+        }
+    )
 
 
-# --- Gemini-powered Search Endpoint ---
+@app.get("/api/search/local")
+def local_search():
+    query = request.args.get("q", "").strip()
+    limit = min(max(request.args.get("limit", default=10, type=int), 1), 50)
+
+    if not query:
+        return jsonify({"error": "missing q"}), 400
+
+    results = local_lexical_search.search(query, limit=limit)
+    return jsonify(
+        {
+            "query": query,
+            "limit": limit,
+            "source": "local_lexical",
+            "corpusSize": local_lexical_search.corpus_size(),
+            "results": results,
+        }
+    )
+
+
+@app.get("/api/search/hybrid")
+def local_hybrid_search():
+    query = request.args.get("q", "").strip()
+    limit = min(max(request.args.get("limit", default=10, type=int), 1), 50)
+    search_text, year, region = parse_query(query)
+
+    if not query:
+        return jsonify({"error": "missing q"}), 400
+
+    results = hybrid_search(search_text, year=year, region=region, limit=limit)
+    return jsonify(
+        {
+            "query": query,
+            "searchText": search_text,
+            "limit": limit,
+            "source": "local_hybrid",
+            "corpusSize": local_lexical_search.corpus_size(),
+            "vectorCorpusSize": local_vector_search.corpus_size(),
+            "vectorBackend": local_vector_search.get_backend(),
+            "results": results,
+        }
+    )
+
+
+@app.get("/api/dataset/<dataset_id>")
+def dataset_details(dataset_id):
+    dataset = get_local_dataset(dataset_id)
+    source = "local_corpus"
+    if dataset is None:
+        dataset = fetch_dataset_by_id(dataset_id)
+        source = "live_cmr"
+    if dataset is None:
+        return jsonify({"error": "Dataset not found"}), 404
+    return jsonify({**dataset, "source": source})
+
+
+@app.get("/api/datasets/<dataset_id>/similar")
+def similar_datasets(dataset_id):
+    limit = min(max(request.args.get("limit", default=5, type=int), 1), 20)
+    dataset, results = get_similar_datasets(dataset_id, limit=limit)
+    if dataset is None:
+        return jsonify({"error": "Dataset not found in local corpus"}), 404
+
+    return jsonify(
+        {
+            "dataset": dataset,
+            "limit": limit,
+            "source": "local_vector_similarity",
+            "results": results,
+        }
+    )
+
+
+@app.post("/api/explain")
+def explain():
+    payload = request.get_json(silent=True) or {}
+    dataset_id = (payload.get("datasetId") or "").strip()
+    audience = (payload.get("audience") or "general").strip().lower()
+
+    if not dataset_id:
+        return jsonify({"error": "datasetId is required"}), 400
+
+    explanation = explain_dataset(dataset_id, audience=audience)
+    if explanation is None:
+        return jsonify({"error": "Dataset not found in local corpus"}), 404
+
+    return jsonify(explanation)
+
+
+@app.get("/api/suggestions")
+def suggestions():
+    query = request.args.get("q", "").strip()
+    limit = min(max(request.args.get("limit", default=5, type=int), 1), 10)
+    if not query:
+        return jsonify({"error": "missing q"}), 400
+
+    return jsonify(
+        {
+            "query": query,
+            "results": suggest_queries(query, limit=limit),
+        }
+    )
+
+
+@app.post("/api/assistant")
+def assistant():
+    payload = request.get_json(silent=True) or {}
+    user_query = (payload.get("query") or "").strip()
+    if not user_query:
+        return jsonify({"error": "Query is required."}), 400
+
+    _, year, region = parse_query(user_query)
+    response = assistant_answer(user_query, year=year, region=region)
+    return jsonify(
+        {
+            **response,
+            "query": {
+                "raw": user_query,
+                "year": year,
+                "region": region,
+            },
+        }
+    )
+
+
+@app.post("/api/compare")
+def compare():
+    payload = request.get_json(silent=True) or {}
+    dataset_ids = payload.get("datasetIds") or []
+    dataset_ids = [str(dataset_id).strip() for dataset_id in dataset_ids if str(dataset_id).strip()]
+    if len(dataset_ids) < 2:
+        return jsonify({"error": "Provide at least two datasetIds."}), 400
+
+    comparison = compare_datasets(dataset_ids[:3])
+    if comparison is None:
+        return jsonify({"error": "Could not load enough datasets from the local corpus."}), 404
+    return jsonify(comparison)
+
+
+@app.post("/api/admin/reindex")
+def admin_reindex():
+    records = load_jsonl()
+    if not records:
+        return jsonify({"error": "No local metadata corpus found. Run ingestion first."}), 400
+
+    rebuild_sqlite(records)
+    build_info = local_vector_search.build(force=True)
+    local_lexical_search.load(force=True)
+    return jsonify(
+        {
+            "status": "ok",
+            "records": len(records),
+            "vector": build_info,
+        }
+    )
+
+
 @app.route("/search", methods=["GET", "POST"])
 def gemini_search():
     if request.method == "POST":
-        data = request.get_json()
-        user_query = data.get('query', '').strip() if data else ''
+        payload = request.get_json(silent=True) or {}
+        user_query = payload.get("query", "").strip()
     else:
-        user_query = request.args.get('query', '').strip()
+        user_query = request.args.get("query", "").strip()
+
     if not user_query:
-        return jsonify({'error': 'Query is required.'}), 400
+        return jsonify({"error": "Query is required."}), 400
+
     try:
         keywords = extract_keywords_gemini(user_query)
-        datasets = search_nasa_cmr(keywords)
-        result = {
-            'originalQuery': user_query,
-            'extractedKeywords': keywords,
-            'datasets': datasets,
-        }
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        datasets = search_nasa_cmr(keywords=keywords)
+        return jsonify(
+            {
+                "originalQuery": user_query,
+                "extractedKeywords": keywords,
+                "datasets": datasets,
+            }
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
-# --- Gemini-powered Chat Assistant Endpoint ---
+
 @app.route("/chat", methods=["POST"])
+@app.route("/api/chat", methods=["POST"])
 def chat_assistant():
-    data = request.get_json()
-    user_query = data.get('query', '').strip()
+    payload = request.get_json(silent=True) or {}
+    user_query = payload.get("query", "").strip()
     if not user_query:
-        return jsonify({'error': 'Query is required.'}), 400
+        return jsonify({"error": "Query is required."}), 400
 
-    keywords = extract_keywords_gemini(user_query)
-    datasets = search_nasa_cmr(keywords)
+    _, year, region = parse_query(user_query)
+    response = assistant_answer(user_query, year=year, region=region)
+    return jsonify(response)
 
-    context = "\n".join([f"{ds['title']}: {ds['summary']}" for ds in datasets[:5]])
-    prompt = (
-        f"User asked: '{user_query}'.\n"
-        f"Here are some relevant NASA datasets:\n{context}\n"
-        "Based on these, answer the user's question in a helpful, concise way. "
-        "If no relevant datasets, say so."
-    )
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt)
-        answer = response.text.strip()
-    except Exception:
-        answer = "Sorry, I couldn't generate an answer due to an error."
 
-    return jsonify({
-        "answer": answer,
-        "datasets": datasets
-    })
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT",5001)),debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5001)), debug=True)

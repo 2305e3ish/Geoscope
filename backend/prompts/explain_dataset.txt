@@ -1,0 +1,16 @@
+Explain the following Earth science dataset for a $audience audience.
+Use only the dataset metadata provided below. Do not invent facts.
+
+Title: $title
+Summary: $summary
+Data center: $data_center
+Time start: $time_start
+Time end: $time_end
+Platforms: $platforms
+Instruments: $instruments
+Science keywords: $science_keywords
+
+Provide:
+1. A short explanation of what the dataset is.
+2. What kinds of questions it could help answer.
+3. One caution or limitation based only on the metadata.

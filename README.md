@@ -1,6 +1,6 @@
-# EarthData Finder (Hackathon Project) 
+# GeoScope
 
-> Full-stack app to search NASA EarthData (CMR) by natural queries, show results on cards and map.
+> Earth Data Intelligence with hybrid retrieval, local indexing, and grounded assistance over NASA CMR metadata.
 
 ## Repo Structure
 
@@ -12,7 +12,89 @@ README.md   # Project info (setup, run, deploy)
 
 ## Quick Start
 
-See backend and frontend folders for setup instructions.
+1. Install backend dependencies
+
+```bash
+pip install -r backend/requirements.txt
+```
+
+2. Create `backend/.env`
+
+```bash
+Copy-Item backend\.env.example backend\.env
+```
+
+Fill in at least:
+
+```env
+GEMINI_API_KEY=your_key_here
+CMR_CLIENT_ID=GeoScope
+```
+
+3. Ingest local metadata
+
+```bash
+python backend/scripts/ingest_cmr.py --page-size 100 --max-pages 2
+```
+
+4. Build the SQLite + BM25 + FAISS indexes
+
+```bash
+python backend/scripts/build_index.py --force
+```
+
+5. Run backend in a new terminal
+
+```bash
+cd backend
+python app.py
+```
+
+Backend runs at `http://localhost:5001`
+
+6. Run frontend in another terminal
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend Vite usually opens at `http://localhost:5173`
+
+7. Open the website
+
+- Home page: `http://localhost:5173`
+- Search workspace: `http://localhost:5173/map`
+
+## Implementation Roadmap
+
+The detailed backend/frontend roadmap for the RAG + hybrid retrieval version of GeoScope lives in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+
+For a current, file-by-file guide to the codebase, see [docs/PROJECT_DOCUMENTATION.md](docs/PROJECT_DOCUMENTATION.md).
+
+## Frontend Environment
+
+Create `frontend/.env` if needed:
+
+```env
+VITE_API_BASE=http://localhost:5001
+```
+
+## API Highlights
+
+```text
+GET  /api/search?q=antarctica&mode=auto
+GET  /api/search/local?q=antarctica
+GET  /api/search/hybrid?q=antarctica
+GET  /api/dataset/<dataset_id>
+GET  /api/datasets/<dataset_id>/similar?limit=5
+GET  /api/suggestions?q=antarctica
+POST /api/explain
+POST /api/assistant
+POST /api/compare
+POST /api/admin/reindex
+```
 
 ## Team Workflow
 - Use feature branches: `feat/frontend-ui`, `feat/backend-api`, `feat/map-visualization`, `feat/integration`

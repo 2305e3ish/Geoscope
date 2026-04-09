@@ -1,7 +1,7 @@
-
-import { useState } from "react";
+/*
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
+import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import axios from "axios";
@@ -12,6 +12,27 @@ const customIcon = new L.Icon({
   iconAnchor: [16, 32],
   popupAnchor: [0, -32]
 });
+*/
+export { default } from "../pages/SearchPage";
+/*
+function hasCoordinates(item) {
+  return Number.isFinite(item?.latitude) && Number.isFinite(item?.longitude);
+}
+
+function MapViewportUpdater({ selected, defaultCenter, defaultZoom }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (hasCoordinates(selected)) {
+      map.setView([selected.latitude, selected.longitude], 6);
+      return;
+    }
+
+    map.setView(defaultCenter, defaultZoom);
+  }, [defaultCenter, defaultZoom, map, selected]);
+
+  return null;
+}
 
 function MapPage() {
   const [showStreetView, setShowStreetView] = useState(false);
@@ -19,6 +40,8 @@ function MapPage() {
   const [results, setResults] = useState([]);
   const [selected, setSelected] = useState(null);
   const [summary, setSummary] = useState(null);
+  const [searchSource, setSearchSource] = useState(null);
+  const [fallbackReason, setFallbackReason] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const navigate = useNavigate();
@@ -26,6 +49,10 @@ function MapPage() {
 
   const defaultCenter = [20, 0];
   const defaultZoom = 2;
+
+  const openDataset = (dataset) => {
+    navigate(`/dataset/${dataset.id}`, { state: { dataset } });
+  };
 
   const handleSearch = async (e) => {
     e.preventDefault();
@@ -35,16 +62,22 @@ function MapPage() {
     setResults([]);
     setSelected(null);
     setSummary(null);
+    setSearchSource(null);
+    setFallbackReason(null);
     try {
-      const { data } = await axios.get(`${API_BASE}/api/search`, { params: { q: search } });
+      const { data } = await axios.get(`${API_BASE}/api/search`, { params: { q: search, mode: "auto" } });
       setResults(data?.results || []);
       setSummary(data?.summary || null);
+      setSearchSource(data?.source || null);
+      setFallbackReason(data?.fallbackReason || null);
       setSelected((data?.results && data.results.length > 0) ? data.results[0] : null);
     } catch {
       setError("An error occurred. Please try a different query.");
       setResults([]);
       setSelected(null);
       setSummary(null);
+      setSearchSource(null);
+      setFallbackReason(null);
     } finally {
       setLoading(false);
     }
@@ -111,6 +144,12 @@ function MapPage() {
         <h2 style={{ fontSize: '1.5rem', marginBottom: '1rem', borderBottom: '1px solid #333', paddingBottom: '0.5rem' }}>Disaster Information</h2>
         {loading && <div style={{padding: '1rem', backgroundColor: '#333', borderRadius: '6px', textAlign: 'center', margin: '18px 0'}}>Loading...</div>}
         {error && <div style={{ color: '#ff6b6b', marginBottom: '12px', padding: '1rem', backgroundColor: '#333', borderRadius: '6px', textAlign: 'center' }}>{error}</div>}
+        {searchSource && (
+          <div style={{ marginBottom: '12px', padding: '0.75rem', backgroundColor: '#262626', borderRadius: '6px', fontSize: '0.9rem' }}>
+            <div><strong>Search source:</strong> {searchSource}</div>
+            {fallbackReason && <div><strong>Fallback:</strong> {fallbackReason}</div>}
+          </div>
+        )}
         
         {/* Layman's Summary Points (Bulleted) */}
         {summary?.layman_summary_points && summary.layman_summary_points.length > 0 && (
@@ -143,7 +182,7 @@ function MapPage() {
             {results.map((r, i) => (
               <div
                 key={r.id || i}
-                onClick={() => navigate(`/dataset/${r.id}`, { state: r })}
+                onClick={() => openDataset(r)}
                 style={{ 
                   background: selected?.id === r.id ? '#444' : '#222', 
                   padding: '1rem', 
@@ -157,6 +196,11 @@ function MapPage() {
                 <p style={{ fontSize: '0.9rem', color: '#ccc', margin: 0 }}>
                   {r.summary ? r.summary.substring(0, 100) + '...' : 'No summary available.'}
                 </p>
+                {r.matchedTerms?.length > 0 && (
+                  <p style={{ fontSize: '0.8rem', color: '#8bb9ff', margin: '0.5rem 0 0 0' }}>
+                    Matched terms: {r.matchedTerms.join(", ")}
+                  </p>
+                )}
               </div>
             ))}
           </div>
@@ -165,10 +209,15 @@ function MapPage() {
       {/* Map panel */}
       <div style={{ flex: 1, position: "relative" }}>
         <MapContainer
-          center={selected && selected.latitude && selected.longitude ? [selected.latitude, selected.longitude] : defaultCenter}
-          zoom={selected && selected.latitude && selected.longitude ? 6 : defaultZoom}
+          center={defaultCenter}
+          zoom={defaultZoom}
           style={{ height: "100%", width: "100%" }}
         >
+          <MapViewportUpdater
+            selected={selected}
+            defaultCenter={defaultCenter}
+            defaultZoom={defaultZoom}
+          />
           <TileLayer
             url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
             attribution="Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
@@ -178,25 +227,34 @@ function MapPage() {
             attribution="Labels © Esri"
           />
           {results.map((r, i) => (
-            (r.latitude && r.longitude) ? (
+            hasCoordinates(r) ? (
               <Marker key={r.id || i} position={[r.latitude, r.longitude]} icon={customIcon} eventHandlers={{ click: () => setSelected(r) }}>
                 <Popup>
                   <h3 style={{ marginBottom: "0.5rem", fontSize: '1rem' }}>{r.title || r.name || r.id}</h3>
                 {(r.timeStart || r.date) && <p style={{margin: '0', fontSize: '0.8rem'}}><strong>Date:</strong> {r.timeStart || r.date}</p>}
-                  {r.latitude && <p style={{margin: '0', fontSize: '0.8rem'}}><strong>Latitude:</strong> {r.latitude}<br /><strong>Longitude:</strong> {r.longitude}</p>}
+                  {hasCoordinates(r) && <p style={{margin: '0', fontSize: '0.8rem'}}><strong>Latitude:</strong> {r.latitude}<br /><strong>Longitude:</strong> {r.longitude}</p>}
                   {r.link && <p style={{margin: '0.5rem 0 0 0', fontSize: '0.9rem'}}><a href={r.link} target="_blank" rel="noopener noreferrer">More Info</a></p>}
                   <button
                     style={{background:"#e8e7e7", marginTop:"0.5rem", border:"1px solid #ccc", borderRadius:"4px", padding:"6px 12px", cursor:"pointer", color:"#222"}}
-                    onClick={() => navigate(`/dataset/${r.id}`, { state: r })}
+                    onClick={() => openDataset(r)}
                   >
                     Open Visualization
+                  </button>
+                  <button
+                    style={{background:"#222", marginTop:"0.5rem", marginLeft:"0.5rem", border:"1px solid #555", borderRadius:"4px", padding:"6px 12px", cursor:"pointer", color:"#fff"}}
+                    onClick={() => {
+                      setSelected(r);
+                      setShowStreetView(true);
+                    }}
+                  >
+                    Street View
                   </button>
                 </Popup>
               </Marker>
             ) : null
           ))}
         </MapContainer>
-        {showStreetView && selected && selected.latitude && selected.longitude && (
+        {showStreetView && hasCoordinates(selected) && (
           <div style={{
             position: "absolute",
             top: "10%",
@@ -231,7 +289,7 @@ function MapPage() {
             <div style={{ padding: "1.5rem" }}>
               <h2 style={{ fontSize: '1.2rem', marginBottom: '0.5rem' }}>{selected.title || selected.name || selected.id}</h2>
                 {(selected.timeStart || selected.date) && <p style={{margin: '0', fontSize: '0.9rem'}}><strong>Date:</strong> {selected.timeStart || selected.date}</p>}
-              {selected.latitude && <p style={{margin: '0', fontSize: '0.9rem'}}><strong>Latitude:</strong> {selected.latitude}<br /><strong>Longitude:</strong> {selected.longitude}</p>}
+              {hasCoordinates(selected) && <p style={{margin: '0', fontSize: '0.9rem'}}><strong>Latitude:</strong> {selected.latitude}<br /><strong>Longitude:</strong> {selected.longitude}</p>}
             </div>
             <iframe
               title="Google Street View"
@@ -250,3 +308,4 @@ function MapPage() {
 }
 
 export default MapPage;
+*/
