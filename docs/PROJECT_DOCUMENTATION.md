@@ -25,11 +25,25 @@ The core idea is simple: the app does not rely on a single search strategy. It c
 
 The local corpus is optional at runtime, but most of the richer experience depends on it being ingested and indexed first.
 
+## 3.1 External Integrations
+
+GeoScope relies on a small set of external services and browser features:
+
+- NASA CMR for live dataset discovery and dataset detail lookups.
+- Google Gemini for keyword extraction, summaries, grounded explanations, and comparison text when `GEMINI_API_KEY` is configured.
+- Esri imagery and label tiles for the Leaflet map background.
+- Google Maps panorama URLs for street-view style previews.
+- Spline-hosted iframe scenes for the animated landing-page background.
+- Browser `localStorage` for recent-search persistence on the search page.
+
+These integrations are optional in different parts of the app, but the product is richest when NASA live search, the local index, and Gemini are all available together.
+
 ## 3. Repository Map
 
 | Path | Purpose |
 | --- | --- |
 | [README.md](../README.md) | Short project overview, quick start, screenshots, and deployment notes. |
+| [.gitignore](../.gitignore) | Ignore rules for node_modules, env files, generated data, and build output. |
 | [docs/IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Historical roadmap and implementation notes. |
 | [docs/PROJECT_DOCUMENTATION.md](PROJECT_DOCUMENTATION.md) | Current detailed documentation. |
 | [package.json](../package.json) | Legacy/shared npm manifest at the repo root. The active frontend app uses [frontend/package.json](../frontend/package.json). |
@@ -38,7 +52,11 @@ The local corpus is optional at runtime, but most of the richer experience depen
 | [backend/.env.example](../backend/.env.example) | Sample backend environment file with the default local values. |
 | [backend/render.yaml](../backend/render.yaml) | Render deployment config for the backend service. |
 | [frontend/package.json](../frontend/package.json) | Active Vite/React app manifest and scripts. |
+| [frontend/README.md](../frontend/README.md) | Frontend-specific setup and route notes. |
 | [frontend/package-lock.json](../frontend/package-lock.json) | Lockfile for the active frontend npm manifest. |
+| [frontend/index.html](../frontend/index.html) | HTML entry shell that mounts the app and loads the Russo One font. |
+| [frontend/vite.config.js](../frontend/vite.config.js) | Vite config with the React plugin enabled. |
+| [frontend/eslint.config.js](../frontend/eslint.config.js) | ESLint config for the frontend package. |
 
 Generated directories such as `node_modules`, `backend/data`, and `frontend/dist` are intentionally not committed.
 
@@ -61,6 +79,15 @@ Generated directories such as `node_modules`, `backend/data`, and `frontend/dist
 - Hybrid ranking weights
 - Named regions used by the query parser
 
+Backend dependency profile:
+
+- `flask` and `flask-cors` provide the API surface and cross-origin support.
+- `requests` is used for both NASA CMR and Gemini HTTP requests.
+- `python-dotenv` loads `.env` files during local development.
+- `sentence-transformers`, `faiss-cpu`, `rank-bm25`, `scikit-learn`, `numpy`, and `joblib` support the local retrieval stack.
+- `gunicorn` is used as the production WSGI server on Render.
+- `google-generativeai` is present in the requirements file, but the current runtime path uses direct Gemini REST calls via `requests`.
+
 ### 4.2 CMR And Metadata Handling
 
 | File | Role |
@@ -77,6 +104,21 @@ Important behavior:
 - If a collection has no direct coordinates, the client tries a granule lookup for a representative location.
 - `query_parser.py` removes years from search text, extracts named regions like `india` or `europe`, and converts them into CMR filters.
 - `metadata_store.py` keeps the ingested corpus in both JSONL and SQLite so the search services can choose the best available source.
+
+Supported query syntax:
+
+- Years are detected for four-digit values in the 1900s and 2000s only.
+- Named regions currently supported by `NAMED_BBOX` are `india`, `global`, `california`, `europe`, and `indonesia`.
+- Region matching is substring-based, so queries like `flood in southern india 2019` still resolve to the `india` bounding box.
+- The parser strips year tokens and punctuation from the search text before passing it to retrieval.
+
+Example:
+
+- Input: `flood in India 2019`
+- Parsed search text: `flood in India`
+- Year: `2019`
+- Region: `india`
+- Search parameters: keyword plus a temporal range and the `india` bounding box
 
 ### 4.3 Retrieval And Ranking
 
@@ -96,6 +138,27 @@ Key retrieval details:
 - `vector_search.py` falls back to TF-IDF and optional SVD if sentence-transformer embedding generation fails.
 - `ranker.py` adds metadata quality and filter matches into the final score and records human-readable reasons.
 - `retriever.py` merges lexical and vector result sets, and it also generates follow-up suggestions from science keywords and keywords.
+
+Result-field details:
+
+- `lexical_search.search()` returns `lexicalScore`, `qualityBoost`, `score`, and `matchedTerms`.
+- `vector_search.search()` returns `vectorScore`, `qualityBoost`, and `matchedTerms`.
+- `vector_search.similar_to()` returns `vectorScore`, `qualityBoost`, and `sharedTerms` for the nearest neighbors.
+- `ranker.combine_ranked_results()` produces `metadataQualityScore`, `matchedFilters`, `matchReasons`, `hybridBreakdown`, `retrievalSources`, and final `score`.
+
+Scoring details:
+
+- Metadata quality gives extra weight to summaries, spatial metadata, keyword count, and science-keyword count.
+- Year matching contributes 0.5 to the filter score when the record time range overlaps the requested year.
+- Region matching contributes 0.5 when the dataset coordinates fall inside the requested bounding box.
+- The hybrid score blends normalized BM25, normalized vector similarity, metadata quality, and filter match scores using the weights from `backend/config.py`.
+
+Fallback behavior:
+
+- `GET /api/search` uses live CMR directly when `mode=live`.
+- If the local corpus exists and `mode=auto`, weak local matches can trigger a live CMR merge.
+- If the local corpus is empty, the backend falls back to live CMR immediately.
+- The search response may include `fallbackReason` values such as `no_local_results`, `weak_local_match`, `weak_local_match_live_empty`, `weak_local_match_live_unavailable`, and `empty_local_corpus`.
 
 The hybrid score is intentionally simple and explainable rather than opaque. It blends:
 
@@ -123,12 +186,20 @@ Important behavior:
 - The assistant and comparison flows are intentionally citation-friendly and avoid inventing datasets or metadata.
 - `similar_datasets.txt` is a useful template for future expansion, but the current similar-dataset endpoint uses vector similarity directly.
 
+Gemini behavior details:
+
+- `extract_keywords_gemini()` is used by the legacy `/search` route to turn a natural-language request into shorter search keywords.
+- `summarize_data_gemini()` asks Gemini for structured summary bullets and falls back to a simple placeholder structure when Gemini fails.
+- `explainer.py` renders `explain_dataset.txt` and returns an explanation plus the source dataset payload.
+- `rag_service.py` renders `research_assistant.txt` for grounded assistant answers and uses a direct fallback answer when the model is unavailable.
+- Dataset comparison uses the retrieved local records only and never pulls live CMR data.
+
 ### 4.5 Scripts And Tests
 
 | File | Role |
 | --- | --- |
 | [backend/scripts/ingest_cmr.py](../backend/scripts/ingest_cmr.py) | Downloads CMR collection pages, normalizes them, and writes the local JSONL corpus. |
-| [backend/scripts/build_index.py](../backend/scripts/build_index.py) | Rebuilds SQLite and FAISS artifacts from the normalized corpus and refreshes the BM25 loader. |
+| [backend/scripts/build_index.py](../backend/scripts/build_index.py) | Rebuilds SQLite and FAISS artifacts from the normalized corpus, refreshes the BM25 loader, and writes the index manifest. |
 | [backend/tests/test_api.py](../backend/tests/test_api.py) | Smoke tests for search and assistant endpoints. |
 | [backend/tests/test_query_parser.py](../backend/tests/test_query_parser.py) | Unit tests for query parsing and search-parameter generation. |
 
@@ -137,6 +208,14 @@ Script workflow:
 1. Run `ingest_cmr.py` to build `backend/data/collections.jsonl`.
 2. Run `build_index.py` to populate SQLite and vector artifacts in `backend/data/indexes/`.
 3. Start the backend or run the tests against the freshly indexed corpus.
+
+Normalized metadata shape:
+
+- `backend/services/cmr_client.py` builds a preview record with `id`, `title`, `summary`, `dataCenter`, `shortName`, `version`, `timeStart`, `timeEnd`, `latitude`, `longitude`, `link`, `boxes`, `platforms`, and `instruments`.
+- `backend/services/metadata_store.py` expands that preview into a richer normalized record with `keywords`, `scienceKeywords`, `spatialKeywords`, `projects`, `relatedUrls`, and a nested `metadataQuality` object.
+- `metadataQuality.hasSummary` indicates whether the summary is real or a placeholder.
+- `metadataQuality.hasSpatial` indicates whether latitude and longitude were found.
+- `metadataQuality.keywordCount` and `metadataQuality.scienceKeywordCount` are used for scoring boosts and final metadata quality scoring.
 
 ### 4.6 API Reference
 
@@ -159,6 +238,12 @@ Script workflow:
 Common response metadata from `/api/search`:
 
 - `source`
+- `query.raw`
+- `query.keyword`
+- `query.year`
+- `query.region`
+- `query.params_sent`
+- `query.mode`
 - `localCorpusSize`
 - `vectorBackend`
 - `fallbackReason`
@@ -166,6 +251,17 @@ Common response metadata from `/api/search`:
 - `searchConfidence`
 - `summary`
 - `results`
+
+Additional endpoint response shapes:
+
+- `GET /api/search/local` returns `query`, `limit`, `source`, `corpusSize`, and `results`.
+- `GET /api/search/hybrid` returns `query`, `searchText`, `limit`, `source`, `corpusSize`, `vectorCorpusSize`, `vectorBackend`, and `results`.
+- `GET /api/dataset/<dataset_id>` returns the dataset payload plus `source`.
+- `GET /api/datasets/<dataset_id>/similar` returns `dataset`, `limit`, `source`, and `results`.
+- `POST /api/explain` returns `dataset`, `audience`, `explanation`, and `source`.
+- `POST /api/assistant` returns `answer`, `datasets`, `citations`, `source`, `generationSource`, and `usedDatasetCount`.
+- `POST /api/compare` returns `comparison`, `datasets`, and `source`.
+- `POST /api/admin/reindex` returns `status`, `records`, and a nested `vector` build report.
 
 ## 5. Data, Indexes, And Generated Artifacts
 
@@ -193,7 +289,7 @@ Recommended refresh order:
 | File | Role |
 | --- | --- |
 | [frontend/src/main.jsx](../frontend/src/main.jsx) | React root, `BrowserRouter`, and app bootstrap. |
-| [frontend/src/App.jsx](../frontend/src/App.jsx) | Route shell for home, search, and dataset pages. |
+| [frontend/src/App.jsx](../frontend/src/App.jsx) | Route shell for home, search, and dataset pages. The file also keeps a large commented legacy single-page implementation for reference. |
 | [frontend/src/api/client.js](../frontend/src/api/client.js) | Centralized backend API client used by the UI. |
 | [frontend/src/index.css](../frontend/src/index.css) | Global Vite-era base styles. |
 | [frontend/src/App.css](../frontend/src/App.css) | App-specific page styling for the current route shell. |
@@ -203,6 +299,17 @@ Routes currently exposed by the app:
 - `/` -> Home page
 - `/map` -> Search workspace
 - `/dataset/:id` -> Dataset detail page
+
+Frontend dependency profile:
+
+- `react` and `react-dom` power the component tree and rendering.
+- `react-router-dom` provides the three-route navigation shell.
+- `axios` is the HTTP client used by `frontend/src/api/client.js`.
+- `leaflet`, `react-leaflet`, and `leaflet-defaulticon-compatibility` power the interactive map.
+- `react-typed` drives the animated landing-page subtitle.
+- `react-icons` is available for iconography in the UI.
+- `react-tsparticles` and `tsparticles` support the particle-style background experiments.
+- `vite` and the ESLint packages handle the local development and lint workflow.
 
 ### 6.2 Active Pages And Components
 
@@ -229,6 +336,7 @@ Important frontend behavior:
 - The street-view experience opens a Google Maps panorama in a new tab because embedded street view is unreliable in many browsers.
 - `DatasetPage.jsx` loads from route state first, then falls back to the backend dataset endpoint.
 - `DatasetPage.jsx` requests both a grounded explanation and similar-dataset recommendations, and it shows scoped error messages if the dataset is not in the local corpus.
+- `App.jsx` is intentionally small for routing, but it also preserves the old monolithic UI implementation in comments.
 
 ### 6.3 Legacy, Compatibility, And Experimental UI
 
@@ -262,6 +370,12 @@ Important frontend behavior:
 - `compareDatasets(datasetIds)`
 
 All calls use `VITE_API_BASE` if set, otherwise they default to `http://localhost:5001`.
+
+Project-level frontend notes:
+
+- `frontend/index.html` still uses the default Vite page title, so the browser tab title can be customized later if desired.
+- `frontend/vite.config.js` is intentionally minimal because the app only needs the React plugin.
+- `frontend/eslint.config.js` ignores the legacy `src/components/MapPage.jsx` wrapper so the old commented implementation does not pollute lint results.
 
 ## 7. Environment Variables
 
@@ -319,9 +433,23 @@ Useful verification commands:
 - The current Render config installs Python requirements and starts `gunicorn app:app -b 0.0.0.0:$PORT`.
 - Frontend deployment is intended for Vercel or another static hosting service, with `VITE_API_BASE` pointing at the backend URL.
 
+Render config details:
+
+- `ALLOWED_ORIGINS` defaults to `*` for simple deployments.
+- `CMR_CLIENT_ID` and `USER_AGENT` are populated with GeoScope defaults.
+- `GEMINI_API_KEY` is marked `sync: false`, which means the secret must be supplied in the Render environment rather than committed to the repo.
+- `EMBEDDING_MODEL` and `RAG_TOP_K` are explicitly set so production behavior matches the local defaults.
+
 ## 10. Current Caveats
 
 - The repo contains a few legacy UI files that are no longer wired into the active route tree.
 - `frontend/src/components/datavisualization.jsx` appears incomplete in this snapshot because it references missing local modules.
 - The root `package.json` exists, but the active app workflow is driven by `frontend/package.json`.
 - Generated corpus and index artifacts are ignored by Git, so a fresh clone will need ingestion and indexing before local hybrid search works.
+
+Frontend package details:
+
+- `frontend/package.json` provides the active scripts: `dev`, `build`, `lint`, and `preview`.
+- `frontend/vite.config.js` is intentionally minimal because the app only needs the React plugin.
+- `frontend/eslint.config.js` ignores the legacy `src/components/MapPage.jsx` wrapper so the old commented implementation does not pollute lint results.
+- `frontend/README.md` is a smaller frontend-only guide, while the root README and this document describe the full repository.

@@ -2,6 +2,8 @@
 
 React + Vite frontend for GeoScope.
 
+For the full repository guide, including backend services, data flow, and deployment details, see [../docs/PROJECT_DOCUMENTATION.md](../docs/PROJECT_DOCUMENTATION.md).
+
 ## Features
 
 - Hybrid dataset search UI
