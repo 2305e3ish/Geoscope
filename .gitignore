@@ -1,6 +1,7 @@
 node_modules/
 frontend/node_modules/
 backend/__pycache__/
+backend/**/__pycache__/
 frontend/dist/
 backend/.env
 frontend/.env
@@ -8,3 +9,4 @@ backend/data/*.jsonl
 backend/data/*.db
 backend/data/indexes/
 *.pyc
+docs/*_extracted.txt

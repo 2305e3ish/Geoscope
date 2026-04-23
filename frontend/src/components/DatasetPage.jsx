@@ -1,247 +1,472 @@
 import { useLocation, useParams } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import axios from "axios";
+import MapBox from "./MapBox";
+import "./DatasetPage.css";
 
-import {
-  fetchDataset as getDataset,
-  fetchDatasetExplanation,
-  fetchSimilarDatasets as getSimilarDatasets,
-} from "../api/client";
-import DatasetComparePanel from "./DatasetComparePanel";
-import SimilarDatasetsPanel from "./SimilarDatasetsPanel";
+const DEFAULT_CENTER = [20, 78];
+
+const flattenStrings = (value) => {
+  if (value === null || value === undefined) return [];
+  if (Array.isArray(value)) return value.flatMap(flattenStrings);
+  if (typeof value === "string") return [value];
+  if (typeof value === "number" || typeof value === "boolean") return [String(value)];
+  if (typeof value === "object") {
+    if (value.href || value.url || value.URL) {
+      return flattenStrings(value.href || value.url || value.URL);
+    }
+    return Object.values(value).flatMap(flattenStrings);
+  }
+  return [];
+};
+
+const uniqueStrings = (value) => Array.from(new Set(flattenStrings(value).map((entry) => entry.trim()).filter(Boolean)));
+
+const formatDate = (value) => {
+  if (!value) return "Unavailable";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat("en", { year: "numeric", month: "short", day: "2-digit" }).format(date);
+};
+
+const formatRange = (start, end) => {
+  if (!start && !end) return "Unavailable";
+  if (start && end) return `${formatDate(start)} to ${formatDate(end)}`;
+  return formatDate(start || end);
+};
+
+const pickFootprint = (dataset) => {
+  if (Array.isArray(dataset?.footprint_bbox) && dataset.footprint_bbox.length === 4) {
+    return dataset.footprint_bbox;
+  }
+
+  const raw = dataset?.raw && typeof dataset.raw === "object" ? dataset.raw : dataset;
+  const boxes = raw?.boxes;
+  if (!boxes || !Array.isArray(boxes) || !boxes.length) return null;
+
+  const firstBox = Array.isArray(boxes[0]) ? boxes[0][0] : boxes[0];
+  if (typeof firstBox !== "string") return null;
+
+  const parts = firstBox.split(",").map((part) => Number(part.trim()));
+  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return null;
+  return parts;
+};
+
+const extractUrls = (value) => {
+  const urls = [];
+  const visit = (entry) => {
+    if (!entry) return;
+    if (typeof entry === "string") {
+      if (/^https?:\/\//i.test(entry)) urls.push(entry);
+      return;
+    }
+    if (Array.isArray(entry)) {
+      entry.forEach(visit);
+      return;
+    }
+    if (typeof entry === "object") {
+      if (entry.href) urls.push(entry.href);
+      if (entry.url) urls.push(entry.url);
+      if (entry.URL) urls.push(entry.URL);
+      if (entry.links) visit(entry.links);
+    }
+  };
+
+  visit(value);
+  return Array.from(new Set(urls.filter(Boolean)));
+};
+
+const JsonTree = ({ value }) => {
+  if (value === null || value === undefined) return <span className="dataset-empty">No data available.</span>;
+
+  if (typeof value !== "object") {
+    return <span className="dataset-json-value">{String(value)}</span>;
+  }
+
+  if (Array.isArray(value)) {
+    return (
+      <div className="dataset-json-array">
+        {value.map((item, index) => (
+          <details key={index} className="dataset-json-node">
+            <summary>Item {index + 1}</summary>
+            <JsonTree value={item} />
+          </details>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="dataset-json-object">
+      {Object.entries(value).map(([key, entryValue]) => (
+        <details key={key} className="dataset-json-node" open={typeof entryValue !== "object" || entryValue === null}>
+          <summary>{key}</summary>
+          <JsonTree value={entryValue} />
+        </details>
+      ))}
+    </div>
+  );
+};
 
 export default function DatasetPage() {
   const { id } = useParams();
   const location = useLocation();
-  const initialDataset = location.state?.dataset || location.state || null;
-  const [dataset, setDataset] = useState(initialDataset);
-  const [loading, setLoading] = useState(!initialDataset);
+  const [dataset, setDataset] = useState(location.state || null);
+  const [loading, setLoading] = useState(!location.state);
   const [error, setError] = useState(null);
-  const [audience, setAudience] = useState("general");
-  const [explanation, setExplanation] = useState(null);
-  const [explanationLoading, setExplanationLoading] = useState(false);
-  const [explanationError, setExplanationError] = useState(null);
-  const [similarDatasets, setSimilarDatasets] = useState([]);
-  const [similarLoading, setSimilarLoading] = useState(false);
-  const [similarError, setSimilarError] = useState(null);
-  const [compareIds, setCompareIds] = useState(() => (id ? [id] : []));
+  const [activeTab, setActiveTab] = useState("overview");
+  const [rawFilter, setRawFilter] = useState("");
+  const [copied, setCopied] = useState(false);
+  const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5001";
 
   useEffect(() => {
-    if (initialDataset?.id === id) {
-      setDataset(initialDataset);
+    let isActive = true;
+
+    if (location.state) {
+      setDataset(location.state);
       setLoading(false);
-      return;
     }
 
-    const loadDataset = async () => {
+    const fetchDataset = async () => {
       try {
-        const data = await getDataset(id);
-        setDataset(data);
+        const { data } = await axios.get(`${API_BASE}/api/dataset/${id}`);
+        if (!isActive) return;
+        setDataset((current) => ({
+          ...(current || {}),
+          ...data,
+          raw: data.raw || current?.raw || current || null,
+        }));
       } catch (err) {
+        if (!isActive) return;
         setError(err.message);
       } finally {
-        setLoading(false);
+        if (isActive) setLoading(false);
       }
     };
 
-    loadDataset();
-  }, [id, initialDataset]);
+    if (!location.state || !location.state.raw || !location.state.footprint_bbox) {
+      fetchDataset();
+    }
 
-  useEffect(() => {
-    const loadExplanation = async () => {
-      if (!id) return;
-
-      setExplanationLoading(true);
-      setExplanationError(null);
-      try {
-        const data = await fetchDatasetExplanation(id, audience);
-        setExplanation(data);
-      } catch (err) {
-        if (err?.response?.status === 404) {
-          setExplanation(null);
-          setExplanationError("Explanation is only available for datasets in the local GeoScope corpus.");
-        } else {
-          setExplanationError("Could not generate a grounded explanation right now.");
-        }
-      } finally {
-        setExplanationLoading(false);
-      }
+    return () => {
+      isActive = false;
     };
+  }, [API_BASE, id, location.state]);
 
-    loadExplanation();
-  }, [audience, id]);
+  const raw = useMemo(
+    () => (dataset?.raw && typeof dataset.raw === "object" ? dataset.raw : (dataset && typeof dataset === "object" ? dataset : {})),
+    [dataset]
+  );
+  const footprint = pickFootprint(dataset);
+  const datasetCenter = useMemo(
+    () => (dataset?.latitude && dataset?.longitude ? [dataset.latitude, dataset.longitude] : null),
+    [dataset?.latitude, dataset?.longitude]
+  );
 
-  useEffect(() => {
-    const loadSimilarDatasets = async () => {
-      if (!id) return;
+  const title = dataset?.title || raw?.title || "Dataset Details";
+  const summary = dataset?.summary || raw?.summary || "No summary available.";
+  const dataCenter = dataset?.dataCenter || raw?.data_center || raw?.dataCenter || "Unknown";
+  const sourceLink = dataset?.link || raw?.links?.find?.((entry) => entry?.href)?.href || null;
 
-      setSimilarLoading(true);
-      setSimilarError(null);
-      try {
-        const data = await getSimilarDatasets(id, 5);
-        setSimilarDatasets(data?.results || []);
-      } catch (err) {
-        if (err?.response?.status === 404) {
-          setSimilarDatasets([]);
-          setSimilarError("Similar-dataset recommendations are only available for locally ingested datasets.");
-        } else {
-          setSimilarError("Could not load similar datasets right now.");
-        }
-      } finally {
-        setSimilarLoading(false);
-      }
-    };
+  const keywords = useMemo(() => uniqueStrings([raw?.keywords, raw?.science_keywords, raw?.theme_keywords, raw?.keyword]), [raw]);
+  const platforms = useMemo(() => uniqueStrings([raw?.platform, raw?.platforms]), [raw]);
+  const instruments = useMemo(() => uniqueStrings([raw?.instrument, raw?.instruments]), [raw]);
+  const formats = useMemo(() => uniqueStrings([raw?.formats, raw?.data_formats, raw?.file_formats, raw?.format]), [raw]);
+  const relatedUrls = useMemo(() => extractUrls([raw?.links, raw?.related_urls, raw?.relatedUrls, raw?.online_access_urls]), [raw]);
 
-    loadSimilarDatasets();
-  }, [id]);
+  const primitiveCount = Object.values(raw).filter((value) => value === null || ["string", "number", "boolean"].includes(typeof value)).length;
+  const arrayCount = Object.values(raw).filter((value) => Array.isArray(value)).length;
+  const objectCount = Object.values(raw).filter((value) => value && typeof value === "object" && !Array.isArray(value)).length;
 
-  useEffect(() => {
-    setCompareIds((previous) => {
-      const next = previous.filter(Boolean);
-      if (id && !next.includes(id)) {
-        return [id, ...next].slice(0, 3);
-      }
-      return next.slice(0, 3);
-    });
-  }, [id]);
+  const rawText = JSON.stringify(raw, null, 2);
+  const filteredRawText = rawFilter.trim()
+    ? rawText
+        .split("\n")
+        .filter((line) => line.toLowerCase().includes(rawFilter.toLowerCase()))
+        .join("\n")
+    : rawText;
 
-  const toggleCompareId = (datasetId) => {
-    setCompareIds((previous) => {
-      if (previous.includes(datasetId)) {
-        return previous.filter((item) => item !== datasetId);
-      }
-      return [...previous, datasetId].slice(0, 3);
-    });
+  const metrics = [
+    { label: "Metadata fields", value: Object.keys(raw).length },
+    { label: "Primitive values", value: primitiveCount },
+    { label: "Arrays", value: arrayCount },
+    { label: "Nested objects", value: objectCount },
+  ];
+
+  const resourceGroups = [
+    { label: "Keywords", values: keywords },
+    { label: "Platforms", values: platforms },
+    { label: "Instruments", values: instruments },
+    { label: "Formats", values: formats },
+  ].filter((group) => group.values.length > 0);
+
+  const quickFacts = [
+    { label: "Provider", value: dataCenter },
+    { label: "Version", value: dataset?.versionId || raw?.version_id || "Unavailable" },
+    { label: "Updated", value: formatDate(dataset?.updated || raw?.updated) },
+    { label: "Temporal range", value: formatRange(dataset?.timeStart || raw?.time_start, dataset?.timeEnd || raw?.time_end) },
+    { label: "Spatial footprint", value: footprint ? "Bounding box available" : datasetCenter ? "Point location available" : "Unavailable" },
+    { label: "Related links", value: String(relatedUrls.length) },
+  ];
+
+  const copyRawJson = async () => {
+    try {
+      await navigator.clipboard.writeText(rawText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
   };
 
-  const metadataQuality = explanation?.dataset?.metadataQuality || dataset?.metadataQuality;
+  const downloadRawJson = () => {
+    const blob = new Blob([rawText], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${(dataset?.id || id || "dataset").replace(/[^a-z0-9-_]+/gi, "_")}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  };
 
-  if (loading) return <div style={{ padding: "2rem", color: "#e5eefc", background: "#08111f", minHeight: "100vh" }}>Loading dataset...</div>;
-  if (error) return <div style={{ padding: "2rem", color: "#fca5a5", background: "#08111f", minHeight: "100vh" }}>Error: {error}</div>;
+  if (loading) {
+    return (
+      <div className="dataset-page dataset-page-loading">
+        <div className="dataset-loading-card">Loading dataset explorer...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="dataset-page dataset-page-loading">
+        <div className="dataset-loading-card dataset-error-card">Error: {error}</div>
+      </div>
+    );
+  }
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(180deg, #08111f 0%, #0f172a 100%)",
-        color: "#e5eefc",
-        padding: "2rem",
-      }}
-    >
-      <div style={{ maxWidth: "1100px", margin: "0 auto" }}>
-        <section
-          style={{
-            padding: "1.5rem",
-            borderRadius: "16px",
-            background: "rgba(15, 23, 42, 0.88)",
-            border: "1px solid rgba(148, 163, 184, 0.22)",
-            boxShadow: "0 24px 60px rgba(2, 6, 23, 0.35)",
-          }}
-        >
-          <h1 style={{ marginTop: 0, marginBottom: "1rem", color: "#f8fafc" }}>
-            {dataset?.title || "Dataset Details"}
-          </h1>
-          <p style={{ marginTop: 0, color: "#cbd5e1", lineHeight: 1.7 }}>
-            {dataset?.summary || "No summary available."}
-          </p>
-          {dataset?.dataCenter && (
-            <p style={{ color: "#dbeafe" }}>
-              <strong>Data Center:</strong> {dataset.dataCenter}
-            </p>
-          )}
-          {dataset?.timeStart && (
-            <p style={{ color: "#dbeafe" }}>
-              <strong>Coverage:</strong> {dataset.timeStart}
-              {dataset?.timeEnd ? ` to ${dataset.timeEnd}` : ""}
-            </p>
-          )}
-          {metadataQuality && (
-            <p style={{ color: "#dbeafe" }}>
-              <strong>Metadata quality:</strong>{" "}
-              Summary {metadataQuality.hasSummary ? "yes" : "no"} | Spatial {metadataQuality.hasSpatial ? "yes" : "no"} | Keywords{" "}
-              {metadataQuality.keywordCount || 0} | Science keywords {metadataQuality.scienceKeywordCount || 0}
-            </p>
-          )}
-          {dataset?.link && (
-            <a
-              href={dataset.link}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{
-                display: "inline-flex",
-                marginTop: "0.75rem",
-                color: "#7dd3fc",
-                textDecoration: "none",
-                fontWeight: 600,
-              }}
-            >
-              View Dataset
+    <div className="dataset-page">
+      <aside className="dataset-sidebar">
+        <div className="dataset-brand">GEOSCOPE.ai</div>
+        <div className="dataset-hero">
+          <p className="dataset-eyebrow">Interactive dataset explorer</p>
+          <h1>{title}</h1>
+          <p className="dataset-summary">{summary}</p>
+        </div>
+
+        <div className="dataset-actions">
+          {sourceLink && (
+            <a className="dataset-button dataset-button-primary" href={sourceLink} target="_blank" rel="noopener noreferrer">
+              Open source dataset
             </a>
           )}
-        </section>
+          <button className="dataset-button" type="button" onClick={copyRawJson}>
+            {copied ? "Copied" : "Copy metadata JSON"}
+          </button>
+          <button className="dataset-button" type="button" onClick={downloadRawJson}>
+            Download JSON
+          </button>
+        </div>
 
-        <section
-          style={{
-            marginTop: "2rem",
-            padding: "1.25rem",
-            borderRadius: "12px",
-            background: "rgba(15, 23, 42, 0.82)",
-            border: "1px solid rgba(148, 163, 184, 0.22)",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              gap: "1rem",
-              flexWrap: "wrap",
-            }}
-          >
-            <h2 style={{ margin: 0, color: "#f8fafc" }}>Grounded Explanation</h2>
-            <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#dbeafe" }}>
-              Audience
-              <select
-                value={audience}
-                onChange={(event) => setAudience(event.target.value)}
-                style={{
-                  background: "#0f172a",
-                  color: "#e2e8f0",
-                  border: "1px solid #334155",
-                  borderRadius: "8px",
-                  padding: "0.45rem 0.6rem",
-                }}
-              >
-                <option value="general">General</option>
-                <option value="student">Student</option>
-                <option value="researcher">Researcher</option>
-              </select>
-            </label>
+        <div className="dataset-tab-list">
+          {[
+            ["overview", "Overview"],
+            ["spatial", "Spatial view"],
+            ["metadata", "Metadata"],
+            ["raw", "Raw explorer"],
+          ].map(([tabKey, label]) => (
+            <button
+              key={tabKey}
+              type="button"
+              className={activeTab === tabKey ? "dataset-tab active" : "dataset-tab"}
+              onClick={() => setActiveTab(tabKey)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="dataset-facts">
+          {quickFacts.map((fact) => (
+            <div className="dataset-fact" key={fact.label}>
+              <span>{fact.label}</span>
+              <strong>{fact.value}</strong>
+            </div>
+          ))}
+        </div>
+      </aside>
+
+      <main className="dataset-main">
+        <section className="dataset-panel dataset-panel-top">
+          <div className="dataset-panel-header">
+            <div>
+              <p className="dataset-eyebrow">Dataset snapshot</p>
+              <h2>Metadata profile</h2>
+            </div>
+            <div className="dataset-pill-row">
+              <span className="dataset-pill">{dataCenter}</span>
+              <span className="dataset-pill">{relatedUrls.length} links</span>
+              <span className="dataset-pill">{footprint ? "Footprint ready" : "Location only"}</span>
+            </div>
           </div>
 
-          {explanationLoading && <p style={{ color: "#cbd5e1" }}>Generating explanation...</p>}
-          {explanationError && <p style={{ color: "#fca5a5" }}>{explanationError}</p>}
-          {!explanationLoading && !explanationError && explanation?.explanation && (
-            <>
-              <p style={{ whiteSpace: "pre-wrap", color: "#dbeafe", lineHeight: 1.7 }}>
-                {explanation.explanation}
-              </p>
-              <p style={{ fontSize: "0.9rem", color: "#94a3b8" }}>
-                Source: {explanation.source}
-              </p>
-            </>
-          )}
+          <div className="dataset-metrics">
+            {metrics.map((metric) => (
+              <div className="dataset-metric" key={metric.label}>
+                <span>{metric.label}</span>
+                <strong>{metric.value}</strong>
+              </div>
+            ))}
+          </div>
+
+          <div className="dataset-bars" aria-label="Metadata complexity bars">
+            {metrics.map((metric, index) => {
+              const maxValue = Math.max(...metrics.map((item) => item.value), 1);
+              const width = Math.max(12, Math.round((metric.value / maxValue) * 100));
+              return (
+                <div className="dataset-bar-row" key={metric.label}>
+                  <div className="dataset-bar-label">
+                    <span>{metric.label}</span>
+                    <strong>{metric.value}</strong>
+                  </div>
+                  <div className="dataset-bar-track">
+                    <div className={`dataset-bar-fill dataset-bar-fill-${index + 1}`} style={{ width: `${width}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </section>
 
-        <SimilarDatasetsPanel
-          datasets={similarDatasets}
-          loading={similarLoading}
-          error={similarError}
-          selectedIds={compareIds}
-          onToggleSelect={toggleCompareId}
-        />
+        <section className="dataset-panel dataset-tab-panel">
+          {activeTab === "overview" && (
+            <div className="dataset-overview-grid">
+              <article className="dataset-card dataset-card-feature">
+                <p className="dataset-eyebrow">What this dataset gives you</p>
+                <h3>Readable overview</h3>
+                <p>
+                  This explorer highlights the most useful metadata, then lets you drill into the raw NASA collection payload without leaving the page.
+                </p>
+                <ul className="dataset-bullets">
+                  <li>Search summary and source link</li>
+                  <li>Spatial footprint preview</li>
+                  <li>Structured metadata browser</li>
+                </ul>
+              </article>
 
-        <DatasetComparePanel datasetIds={compareIds} />
-      </div>
+              <article className="dataset-card dataset-card-mini">
+                <p className="dataset-eyebrow">Coverage</p>
+                <h3>{footprint ? "Mapped footprint" : "No box footprint"}</h3>
+                <p>{datasetCenter ? "A point marker is available for this result." : "The collection did not return a simple point marker."}</p>
+              </article>
+
+              <article className="dataset-card dataset-card-mini">
+                <p className="dataset-eyebrow">Related assets</p>
+                <h3>{relatedUrls.length}</h3>
+                <p>External dataset links, browse URLs, or access endpoints are listed in the metadata tab.</p>
+              </article>
+            </div>
+          )}
+
+          {activeTab === "spatial" && (
+            <div className="dataset-spatial-layout">
+              <div className="dataset-map-card">
+                <MapBox bbox={footprint} center={datasetCenter || DEFAULT_CENTER} marker={datasetCenter ? { latlng: datasetCenter, popup: title } : null} />
+              </div>
+              <div className="dataset-card dataset-card-geo">
+                <p className="dataset-eyebrow">Spatial intelligence</p>
+                <h3>Coverage details</h3>
+                <p>
+                  {footprint
+                    ? "The map highlights the geographic footprint returned by NASA CMR."
+                    : "This dataset did not include a clear bounding box, so the explorer falls back to a point marker when available."}
+                </p>
+                <div className="dataset-mini-grid">
+                  <div>
+                    <span>Start</span>
+                    <strong>{formatDate(dataset?.timeStart || raw?.time_start)}</strong>
+                  </div>
+                  <div>
+                    <span>End</span>
+                    <strong>{formatDate(dataset?.timeEnd || raw?.time_end)}</strong>
+                  </div>
+                  <div>
+                    <span>Provider</span>
+                    <strong>{dataCenter}</strong>
+                  </div>
+                  <div>
+                    <span>Location mode</span>
+                    <strong>{footprint ? "Area" : datasetCenter ? "Point" : "Unknown"}</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "metadata" && (
+            <div className="dataset-metadata-layout">
+              {resourceGroups.map((group) => (
+                <section className="dataset-card" key={group.label}>
+                  <p className="dataset-eyebrow">{group.label}</p>
+                  <h3>{group.values.length} items</h3>
+                  <div className="dataset-chip-cloud">
+                    {group.values.map((item) => (
+                      <span className="dataset-chip" key={item}>
+                        {item}
+                      </span>
+                    ))}
+                  </div>
+                </section>
+              ))}
+
+              <section className="dataset-card dataset-links-card">
+                <p className="dataset-eyebrow">Related links</p>
+                <h3>{relatedUrls.length} URLs</h3>
+                <ul className="dataset-link-list">
+                  {relatedUrls.length > 0 ? (
+                    relatedUrls.map((url) => (
+                      <li key={url}>
+                        <a href={url} target="_blank" rel="noopener noreferrer">
+                          {url}
+                        </a>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="dataset-empty">No external links were exposed by the collection response.</li>
+                  )}
+                </ul>
+              </section>
+            </div>
+          )}
+
+          {activeTab === "raw" && (
+            <section className="dataset-card dataset-raw-card">
+              <div className="dataset-raw-controls">
+                <div>
+                  <p className="dataset-eyebrow">Raw explorer</p>
+                  <h3>Inspect the complete collection payload</h3>
+                </div>
+                <input
+                  type="text"
+                  value={rawFilter}
+                  onChange={(event) => setRawFilter(event.target.value)}
+                  placeholder="Filter keys or values"
+                  className="dataset-input"
+                />
+              </div>
+              <div className="dataset-raw-viewer">
+                {filteredRawText ? <pre>{filteredRawText}</pre> : <div className="dataset-empty">No matching lines found.</div>}
+              </div>
+              <div className="dataset-tree">
+                <JsonTree value={raw} />
+              </div>
+            </section>
+          )}
+        </section>
+      </main>
     </div>
   );
 }
